@@ -15,7 +15,9 @@
 //! [`StructureWriter`] that produces a new Stream with one or more values
 //! replaced, as ADR-0013 asks of anything that changes content. Promote reads
 //! through the first two; demote writes through the first and third; route and
-//! process read.
+//! process read. The JSON document itself — parsed once, bridged to a scalar,
+//! written back as a Stream — is the capability's `json`, shared with the
+//! other JSON languages (ADR-0044); what is dot's is the selector walk.
 //!
 //! A selector declares how far it reaches — [`Selector::reach`] — and that
 //! declaration is the load-bearing part: it is what lets a Receive Location be
@@ -30,11 +32,10 @@ mod walk;
 pub use selector::{Reach, Segment, Selector};
 
 use contract::{
-    ContractDescriptor, ContractError, ContractId, StructureReader, StructureWriter,
-    StructuredValue,
+    ContractDescriptor, ContractError, StructureReader, StructureWriter, StructuredValue,
 };
+use path::json::{self, Document, Rewrite};
 use path::{Path, PathCost, PathEngine};
-use serde_json::Value;
 use stream::Stream;
 use xcore::StreamId;
 
@@ -71,24 +72,9 @@ impl PathEngine for DotEngine {
     }
 }
 
-fn descriptor() -> ContractDescriptor {
-    ContractDescriptor {
-        id: ContractId("json-schema".to_string()),
-        version: "1".to_string(),
-        representation: "application/json".to_string(),
-    }
-}
-
-fn parse(stream: &Stream) -> Result<Value, ContractError> {
-    serde_json::from_slice(stream.bytes()).map_err(|error| ContractError {
-        message: format!("not valid JSON: {error}"),
-    })
-}
-
 /// A JSON Stream, read by selector.
 pub struct DotStructure {
-    descriptor: ContractDescriptor,
-    value: Value,
+    document: Document,
 }
 
 impl DotStructure {
@@ -98,30 +84,27 @@ impl DotStructure {
     /// The Stream is not JSON.
     pub fn parse(stream: &Stream) -> Result<Self, ContractError> {
         Ok(Self {
-            descriptor: descriptor(),
-            value: parse(stream)?,
+            document: Document::parse(stream)?,
         })
     }
 }
 
 impl StructureReader for DotStructure {
     fn contract(&self) -> &ContractDescriptor {
-        &self.descriptor
+        &self.document.descriptor
     }
 
     fn read(&self, path: &str) -> Result<Option<StructuredValue>, ContractError> {
         let selector = Selector::parse(path)?;
-        walk::read(&self.value, selector.segments())
-            .map(|found| scalar(found, path))
+        walk::read(&self.document.value, selector.segments())
+            .map(|found| json::scalar(found, path))
             .transpose()
     }
 }
 
 /// A JSON Stream being rewritten into a new one.
 pub struct DotRewrite {
-    descriptor: ContractDescriptor,
-    id: StreamId,
-    value: Value,
+    rewrite: Rewrite,
 }
 
 impl DotRewrite {
@@ -131,16 +114,14 @@ impl DotRewrite {
     /// The Stream is not JSON.
     pub fn of(stream: &Stream, id: StreamId) -> Result<Self, ContractError> {
         Ok(Self {
-            descriptor: descriptor(),
-            id,
-            value: parse(stream)?,
+            rewrite: Rewrite::of(stream, id)?,
         })
     }
 }
 
 impl StructureWriter for DotRewrite {
     fn contract(&self) -> &ContractDescriptor {
-        &self.descriptor
+        &self.rewrite.descriptor
     }
 
     /// Replace the value at every place `path` resolves to, or add a last
@@ -148,68 +129,25 @@ impl StructureWriter for DotRewrite {
     /// refused: demote names a place, it does not invent structure.
     fn write(&mut self, path: &str, value: StructuredValue) -> Result<(), ContractError> {
         let selector = Selector::parse(path)?;
-        let replacement = json(value)?;
-        if walk::write(&mut self.value, selector.segments(), &replacement) == 0 {
-            return Err(ContractError {
-                message: format!("{path:?} names nothing to write into"),
-            });
+        let replacement = json::from_scalar(value)?;
+        if walk::write(&mut self.rewrite.value, selector.segments(), &replacement) == 0 {
+            return Err(ContractError::new(format!(
+                "{path:?} names nothing to write into"
+            )));
         }
         Ok(())
     }
 
     fn finish(self: Box<Self>) -> Result<Stream, ContractError> {
-        let bytes = serde_json::to_vec(&self.value).map_err(|error| ContractError {
-            message: format!("cannot serialise JSON: {error}"),
-        })?;
-        Ok(Stream::new(
-            self.id,
-            bytes,
-            Some(self.descriptor.representation),
-        ))
+        self.rewrite.finish()
     }
-}
-
-fn scalar(value: &Value, path: &str) -> Result<StructuredValue, ContractError> {
-    Ok(match value {
-        Value::Null => StructuredValue::Null,
-        Value::Bool(flag) => StructuredValue::Bool(*flag),
-        Value::Number(number) => match number.as_i64() {
-            Some(integer) => StructuredValue::Integer(integer),
-            None => StructuredValue::Decimal(number.as_f64().unwrap_or(f64::NAN)),
-        },
-        Value::String(text) => StructuredValue::Text(text.clone()),
-        Value::Array(_) | Value::Object(_) => {
-            return Err(ContractError {
-                message: format!("{path} is not a scalar"),
-            });
-        }
-    })
-}
-
-fn json(value: StructuredValue) -> Result<Value, ContractError> {
-    Ok(match value {
-        StructuredValue::Null => Value::Null,
-        StructuredValue::Bool(flag) => Value::Bool(flag),
-        StructuredValue::Integer(integer) => Value::from(integer),
-        StructuredValue::Decimal(decimal) => {
-            serde_json::Number::from_f64(decimal).map_or(Value::Null, Value::Number)
-        }
-        StructuredValue::Text(text) => Value::String(text),
-        StructuredValue::Binary(_) => {
-            return Err(ContractError {
-                message: "binary has no JSON form here".to_string(),
-            });
-        }
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn stream(text: &str) -> Stream {
-        Stream::new(StreamId::new(1), text.as_bytes().to_vec(), None)
-    }
+    use path::fixture::stream;
+    use serde_json::Value;
 
     const ORDER: &str = concat!(
         r#"{"id":"A1","paid":false,"headers":{"x-ref":"R"},"#,
