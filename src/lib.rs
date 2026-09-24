@@ -31,11 +31,11 @@ mod walk;
 
 pub use selector::{Reach, Segment, Selector};
 
-use path::json::{self, Document, Rewrite};
-use path::{Path, PathCost, PathEngine};
-use sdk::contract::{
+use contract::{
     ContractDescriptor, ContractError, StructureReader, StructureWriter, StructuredValue,
 };
+use path::json::{self, Document, Rewrite};
+use path::{Path, PathCost, PathEngine};
 use stream::Stream;
 use xcore::StreamId;
 
