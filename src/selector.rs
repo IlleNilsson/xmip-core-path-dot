@@ -3,7 +3,7 @@
 //! operator writes; the [`Selector`] is what a Content Module walks with, and
 //! its [`Reach`] is the declaration `runtime-model.md` calls load-bearing.
 
-use sdk::contract::ContractError;
+use contract::ContractError;
 use std::fmt;
 
 /// One step of a selector. Four kinds, and the brackets are Xmip notation,
