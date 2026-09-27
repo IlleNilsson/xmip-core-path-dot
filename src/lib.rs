@@ -9,181 +9,117 @@
 //! notation, not `JSONPath`'s. `[n]` is the first occurrence when reading and
 //! every occurrence when writing.
 //!
-//! Three things, because a path language is nothing without content to address:
-//! [`DotEngine`], the [`PathEngine`] for the language `dot`; [`DotStructure`],
-//! a [`StructureReader`] over a JSON Stream; and [`DotRewrite`], a
-//! [`StructureWriter`] that produces a new Stream with one or more values
-//! replaced, as ADR-0013 asks of anything that changes content. Promote reads
-//! through the first two; demote writes through the first and third; route and
-//! process read. The JSON document itself — parsed once, bridged to a scalar,
-//! written back as a Stream — is the capability's `json`, shared with the
-//! other JSON languages (ADR-0044); what is dot's is the selector walk.
+//! [`DotLanguage`] is the [`PathLanguage`] `dot`: it compiles a selector
+//! once, and the compiled [`Selector`] reads one value from a Stream's JSON
+//! and writes into a rewrite of it (ADR-0013). Promote reads through it;
+//! demote writes through it; route and process read. The JSON document itself
+//! — parsed once per Message, bridged to a scalar, written back as a Stream —
+//! is the capability's `json`, shared with the other JSON languages
+//! (ADR-0044); what is dot's is the selector walk.
 //!
 //! A selector declares how far it reaches — [`Selector::reach`] — and that
 //! declaration is the load-bearing part: it is what lets a Receive Location be
-//! configured with promotions that are cheap by construction. This crate reads
-//! JSON through a parsed document, so its engine reports the honest
-//! [`PathCost::Materialized`]; a streaming reader over the same selectors
-//! would report the declared reach instead.
+//! configured with promotions that are cheap by construction. This crate
+//! reads JSON through a document parsed whole; a streaming reader over the
+//! same selectors would answer from the declared reach instead.
 
 mod selector;
 mod walk;
 
 pub use selector::{Reach, Segment, Selector};
 
-use contract::{
-    ContractDescriptor, ContractError, StructureReader, StructureWriter, StructuredValue,
-};
-use path::json::{self, Document, Rewrite};
-use path::{Path, PathCost, PathEngine};
-use stream::Stream;
-use xcore::StreamId;
+use contract::ContractError;
+use path::{CompiledExpression, Content, PathLanguage, Rewriting, json};
+use serde_json::Value;
+use xcore::ScalarValue;
 
-/// The `dot` engine. The reader speaks selectors already, so the engine adds
-/// no traversal of its own.
-pub struct DotEngine;
+/// The language `dot`.
+pub struct DotLanguage;
 
-impl PathEngine for DotEngine {
+impl PathLanguage for DotLanguage {
     fn language(&self) -> &'static str {
         "dot"
     }
 
-    fn read(
-        &self,
-        reader: &dyn StructureReader,
-        path: &Path,
-    ) -> Result<Option<StructuredValue>, ContractError> {
-        reader.read(&path.expression)
-    }
-
-    fn write(
-        &self,
-        writer: &mut dyn StructureWriter,
-        path: &Path,
-        value: StructuredValue,
-    ) -> Result<(), ContractError> {
-        writer.write(&path.expression, value)
-    }
-
-    /// The JSON reader parses the document whole, whatever the selector
-    /// declares; the declaration is answered by [`Selector::reach`].
-    fn cost(&self, _path: &Path) -> PathCost {
-        PathCost::Materialized
+    fn compile(&self, expression: &str) -> Result<Box<dyn CompiledExpression>, ContractError> {
+        Ok(Box::new(Compiled {
+            selector: Selector::parse(expression)?,
+            expression: expression.to_string(),
+        }))
     }
 }
 
-/// A JSON Stream, read by selector.
-pub struct DotStructure {
-    document: Document,
+/// A selector compiled, with the text a refusal names.
+struct Compiled {
+    selector: Selector,
+    expression: String,
 }
 
-impl DotStructure {
-    /// Parse `stream` once; every read is a selector walk after that.
-    ///
-    /// # Errors
-    /// The Stream is not JSON.
-    pub fn parse(stream: &Stream) -> Result<Self, ContractError> {
-        Ok(Self {
-            document: Document::parse(stream)?,
-        })
-    }
-}
-
-impl StructureReader for DotStructure {
-    fn contract(&self) -> &ContractDescriptor {
-        &self.document.descriptor
-    }
-
-    fn read(&self, path: &str) -> Result<Option<StructuredValue>, ContractError> {
-        let selector = Selector::parse(path)?;
-        walk::read(&self.document.value, selector.segments())
-            .map(|found| json::scalar(found, path))
+impl CompiledExpression for Compiled {
+    fn read(&self, content: &Content<'_>) -> Result<Option<ScalarValue>, ContractError> {
+        let document = content.form::<Value>()?;
+        walk::read(&document, self.selector.segments())
+            .map(|found| json::scalar(found, &self.expression))
             .transpose()
     }
-}
 
-/// A JSON Stream being rewritten into a new one.
-pub struct DotRewrite {
-    rewrite: Rewrite,
-}
-
-impl DotRewrite {
-    /// Start from `stream`; the Stream `finish` produces carries `id`.
-    ///
-    /// # Errors
-    /// The Stream is not JSON.
-    pub fn of(stream: &Stream, id: StreamId) -> Result<Self, ContractError> {
-        Ok(Self {
-            rewrite: Rewrite::of(stream, id)?,
-        })
-    }
-}
-
-impl StructureWriter for DotRewrite {
-    fn contract(&self) -> &ContractDescriptor {
-        &self.rewrite.descriptor
-    }
-
-    /// Replace the value at every place `path` resolves to, or add a last
-    /// name or key to the object it names. A selector into nothing is
+    /// Replace the value at every place the selector resolves to, or add a
+    /// last name or key to the object it names. A selector into nothing is
     /// refused: demote names a place, it does not invent structure.
-    fn write(&mut self, path: &str, value: StructuredValue) -> Result<(), ContractError> {
-        let selector = Selector::parse(path)?;
+    fn write(&self, rewriting: &mut Rewriting, value: ScalarValue) -> Result<(), ContractError> {
         let replacement = json::from_scalar(value)?;
-        if walk::write(&mut self.rewrite.value, selector.segments(), &replacement) == 0 {
+        let document = rewriting.form_mut::<Value>()?;
+        if walk::write(document, self.selector.segments(), &replacement) == 0 {
             return Err(ContractError::new(format!(
-                "{path:?} names nothing to write into"
+                "{:?} names nothing to write into",
+                self.expression
             )));
         }
         Ok(())
-    }
-
-    fn finish(self: Box<Self>) -> Result<Stream, ContractError> {
-        self.rewrite.finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use path::fixture::stream;
-    use serde_json::Value;
+    use contract::fixture::stream;
+    use xcore::StreamId;
 
     const ORDER: &str = concat!(
         r#"{"id":"A1","paid":false,"headers":{"x-ref":"R"},"#,
         r#""lines":[{"sku":"X","qty":2,"price":9.5},{"sku":"Y","qty":1}]}"#
     );
 
+    fn compiled(selector: &str) -> Result<Box<dyn CompiledExpression>, ContractError> {
+        DotLanguage.compile(selector)
+    }
+
     #[test]
     fn reads_scalars_by_selector_and_refuses_structures() {
-        let structure = DotStructure::parse(&stream(ORDER)).expect("parses");
-        let engine = DotEngine;
-        let read = |p: &str| engine.read(&structure, &Path::new("dot", p));
+        let order = stream(ORDER);
+        let content = Content::of(&order);
+        let read = |p: &str| compiled(p)?.read(&content);
         assert_eq!(
             read("id").expect("reads"),
-            Some(StructuredValue::Text("A1".into()))
+            Some(ScalarValue::Text("A1".into()))
         );
-        assert_eq!(
-            read("paid").expect("reads"),
-            Some(StructuredValue::Bool(false))
-        );
+        assert_eq!(read("paid").expect("reads"), Some(ScalarValue::Bool(false)));
         assert_eq!(
             read("headers['x-ref']").expect("reads"),
-            Some(StructuredValue::Text("R".into()))
+            Some(ScalarValue::Text("R".into()))
         );
         assert_eq!(
             read("lines[1].qty").expect("reads"),
-            Some(StructuredValue::Integer(1))
+            Some(ScalarValue::Integer(1))
         );
         assert_eq!(
             read("lines[n].price").expect("reads"),
-            Some(StructuredValue::Decimal(9.5))
+            Some(ScalarValue::Decimal(9.5))
         );
         assert_eq!(read("lines[n].colour").expect("reads"), None);
         assert_eq!(read("nowhere").expect("reads"), None);
         assert!(read("lines").is_err());
         assert!(read("lines[").is_err());
-        assert_eq!(engine.cost(&Path::new("dot", "id")), PathCost::Materialized);
         assert_eq!(
             Selector::parse("lines[n].price").expect("parses").reach(),
             Reach::StreamScan
@@ -192,19 +128,18 @@ mod tests {
 
     #[test]
     fn rewrites_into_a_new_stream_with_the_given_id() {
-        let mut rewrite = DotRewrite::of(&stream(ORDER), StreamId::new(2)).expect("parses");
-        let engine = DotEngine;
+        let mut rewriting = Rewriting::of(&stream(ORDER), StreamId::new(2));
         let mut write =
-            |p: &str, v: StructuredValue| engine.write(&mut rewrite, &Path::new("dot", p), v);
-        write("paid", StructuredValue::Bool(true)).expect("writes");
-        write("headers['x-ref']", StructuredValue::Text("R7".into())).expect("writes");
-        write("lines[n].qty", StructuredValue::Integer(0)).expect("writes every line");
-        write("lines[1].note", StructuredValue::Null).expect("adds");
-        assert!(write("lines[5].qty", StructuredValue::Integer(1)).is_err());
-        assert!(write("nowhere.deep", StructuredValue::Null).is_err());
-        assert!(write("id", StructuredValue::Binary(vec![1])).is_err());
-        assert!(write("", StructuredValue::Null).is_err());
-        let out = Box::new(rewrite).finish().expect("finishes");
+            |p: &str, v: ScalarValue| compiled(p).and_then(|c| c.write(&mut rewriting, v));
+        write("paid", ScalarValue::Bool(true)).expect("writes");
+        write("headers['x-ref']", ScalarValue::Text("R7".into())).expect("writes");
+        write("lines[n].qty", ScalarValue::Integer(0)).expect("writes every line");
+        write("lines[1].note", ScalarValue::Null).expect("adds");
+        assert!(write("lines[5].qty", ScalarValue::Integer(1)).is_err());
+        assert!(write("nowhere.deep", ScalarValue::Null).is_err());
+        assert!(write("id", ScalarValue::Binary(vec![1])).is_err());
+        assert!(write("", ScalarValue::Null).is_err());
+        let out = rewriting.finish().expect("finishes");
         assert_eq!(out.id(), StreamId::new(2));
         assert_eq!(out.media_type(), Some("application/json"));
         let back: Value = serde_json::from_slice(out.bytes()).expect("json");
@@ -221,8 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_that_is_not_json_is_refused_up_front() {
-        assert!(DotStructure::parse(&stream("{nope")).is_err());
-        assert!(DotRewrite::of(&stream("{nope"), StreamId::new(1)).is_err());
+    fn a_stream_that_is_not_json_is_refused() {
+        let broken = stream("{nope");
+        let id = compiled("id").expect("compiles");
+        assert!(id.read(&Content::of(&broken)).is_err());
+        assert!(
+            id.write(
+                &mut Rewriting::of(&broken, StreamId::new(1)),
+                ScalarValue::Null
+            )
+            .is_err()
+        );
     }
 }
