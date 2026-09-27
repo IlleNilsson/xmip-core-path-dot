@@ -5,6 +5,8 @@ streaming wildcard — read and written over a JSON Stream, for promote, demote,
 route and process. A technology of
 [xmip-core-path](https://github.com/IlleNilsson/xmip-core-path).
 
+`DotLanguage` is the `PathLanguage` for the language `dot`: a selector compiles once, and the JSON a Message carries is parsed once for every JSON path reading it.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
