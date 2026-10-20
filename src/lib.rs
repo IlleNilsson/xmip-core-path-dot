@@ -116,7 +116,7 @@ mod tests {
             read("lines[n].price").expect("reads"),
             Some(ScalarValue::Decimal(9.5))
         );
-        assert_eq!(read("lines[n].colour").expect("reads"), None);
+        assert_eq!(read("lines[n].color").expect("reads"), None);
         assert_eq!(read("nowhere").expect("reads"), None);
         assert!(read("lines").is_err());
         assert!(read("lines[").is_err());
