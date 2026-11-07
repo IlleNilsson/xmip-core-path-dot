@@ -126,10 +126,7 @@ fn bracket(body: &str) -> Option<Segment> {
     if body == "n" {
         return Some(Segment::Any);
     }
-    if let Some(key) = body
-        .strip_prefix('\'')
-        .and_then(|quoted| quoted.strip_suffix('\''))
-    {
+    if let Some(key) = body.strip_circumfix('\'', '\'') {
         return (!key.contains('\'')).then(|| Segment::Key(key.to_string()));
     }
     body.parse().ok().map(Segment::Number)
