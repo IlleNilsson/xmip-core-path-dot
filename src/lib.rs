@@ -29,7 +29,7 @@ mod walk;
 pub use selector::{Reach, Segment, Selector};
 
 use contract::ContractError;
-use path::{CompiledExpression, Content, PathLanguage, Rewriting, json};
+use path::{CompiledExpression, Content, Namespaces, PathLanguage, Rewriting, json};
 use serde_json::Value;
 use xcore::ScalarValue;
 
@@ -41,7 +41,12 @@ impl PathLanguage for DotLanguage {
         "dot"
     }
 
-    fn compile(&self, expression: &str) -> Result<Box<dyn CompiledExpression>, ContractError> {
+    fn compile(
+        &self,
+        expression: &str,
+        namespaces: &Namespaces,
+    ) -> Result<Box<dyn CompiledExpression>, ContractError> {
+        namespaces.unused_by(self.language())?;
         Ok(Box::new(Compiled {
             selector: Selector::parse(expression)?,
             expression: expression.to_string(),
@@ -91,7 +96,7 @@ mod tests {
     );
 
     fn compiled(selector: &str) -> Result<Box<dyn CompiledExpression>, ContractError> {
-        DotLanguage.compile(selector)
+        DotLanguage.compile(selector, &Namespaces::new())
     }
 
     #[test]
