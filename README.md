@@ -7,11 +7,6 @@ route and process. A technology of
 
 `DotLanguage` is the `PathLanguage` for the language `dot`: a selector compiles once, and the JSON a Message carries is parsed once for every JSON path reading it.
 
-## Toolchain
-
-`rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
-here.
-
 ## Verification
 
 The included workflow is manual-only and calls the versioned shared workflow at
